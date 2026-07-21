@@ -50,6 +50,41 @@ local function main()
     end
 
     cv.releaseMat(shot)
+
+    -- 5. 高层函数演示：用刚才的 shot.png 自动验证找图链路
+    -- shot.png 是全屏截图（场景），从里面裁一小块作为"模板"，再在原图里找它
+    -- 这样无需手动准备 template.png，运行即可看到找图效果
+    local scene = cv.loadImage(savePath)  -- 复用前面保存的 shot.png
+    if scene then
+        -- 从场景中裁一块 200x200 保存为模板（选有内容的区域）
+        local tx, ty, tw, th = 100, 300, 200, 200
+        if cv.cropAndSave(scene, tx, ty, tw, th, tmplPath) then
+            print(string.format("✓ 已从截图生成模板: 起点(%d,%d) 尺寸%dx%d", tx, ty, tw, th))
+            -- 用 findImageIn 在场景中找这块模板（不截图，复用已有 scene）
+            local r = cv.findImageIn(scene, tmplPath, 100.0, cv.MATCH_SIFT)
+            if r and r.found then
+                print(string.format("✓ findImageIn 找到: 中心(%d,%d) 置信度=%.0f", r.x, r.y, r.confidence))
+                print(string.format("  预期中心约 (%d,%d)（模板起点+尺寸一半）", tx + tw/2, ty + th/2))
+            else
+                print("✗ findImageIn 未找到（该区域特征点不足，可调整裁剪位置或降低阈值到 50）")
+            end
+        end
+        cv.releaseMat(scene)
+    end
+
+    -- 更多高层用法（按需取消注释，部分会真实操作屏幕）：
+    -- cv.findImageAndClick(tmplPath, nil, 100.0)              -- 找图并点击
+    -- cv.clickIfFound(tmplPath, nil, 100.0)                   -- 简化找图点击
+    -- cv.waitForImage(tmplPath, 5000, 500)                    -- 等待出现（5秒超时）
+    -- cv.waitForImageAndClick(tmplPath, 5000, 500)            -- 等待并点击
+    -- cv.waitForImageGone(tmplPath, 5000, 500)                -- 等待消失
+    -- cv.findAnyImage({"a.png","b.png"}, nil, 100.0)          -- 多图找第一个
+    -- cv.waitForAnyImage({"a.png","b.png"}, 5000, 500)        -- 等待任一出现
+    -- cv.clickAllFound(tmplPath, 5, 800)                      -- 连续点击最多5次
+    -- cv.dragImage(tmplPath, 300, 300, 500)                   -- 找到后拖拽到(300,300)
+    -- cv.captureTemplate(100, 100, 80, 80, getWorkPath().."/btn.png")  -- 截取屏幕区域作为模板
+    -- cv.clearTemplateCache()                                 -- 清除模板缓存
+
     print("✓ 示例执行完毕")
 end
 

@@ -49,7 +49,8 @@ bool locateTemplateImpl(const cv::Mat &sceneDesc, const std::vector<cv::KeyPoint
 
     int good = (int)tmplPts.size();
     if (good_count) *good_count = good;
-    if (conf) *conf = (double)good;
+    // confidence 归一化为 0-100 匹配率：良好匹配数 / 模板特征点数 × 100（100=模板特征全部命中）
+    if (conf) *conf = tmplKp.empty() ? 0.0 : (double)good / (double)tmplKp.size() * 100.0;
     if (good < kMinMatches)
         return false;
 
@@ -164,6 +165,7 @@ void findImageBySIFT(void *scene, void *template_img, double threshold,
     double conf = 0;
     locateTemplateSIFT(sceneDesc, sceneKp, *toMat(template_img), threshold,
                        center_x, center_y, &conf, &good);
+    if (confidence) *confidence = conf; // 回写置信度（=良好匹配数），修复此前输出参数遗漏
     g_lastMatch.confidence = conf;
     g_lastMatch.keypoints_count = (int)sceneKp.size();
     g_lastMatch.good_matches_count = good;
@@ -190,6 +192,7 @@ void findImageByORB(void *scene, void *template_img, double threshold,
     double conf = 0;
     locateTemplateORB(sceneDesc, sceneKp, *toMat(template_img), threshold,
                       center_x, center_y, &conf, &good);
+    if (confidence) *confidence = conf; // 回写置信度（=良好匹配数），修复此前输出参数遗漏
     g_lastMatch.confidence = conf;
     g_lastMatch.keypoints_count = (int)sceneKp.size();
     g_lastMatch.good_matches_count = good;
