@@ -22,10 +22,11 @@ if(NOT DEFINED OPENCV_SDK)
 endif()
 
 # OpenCV 4.5.3 Android SDK 为动态库模式（libopencv_java4.so 单体库）
-# find_package 后 OpenCV_LIBS 指向 opencv_java4，链接产出 NEEDED libopencv_java4.so，
-# 运行时由懒人精灵进程内已加载的同名库提供符号。
+# opencv_java4 包含全部模块，运行时由懒人精灵进程内已加载的 libopencv_java4.so 提供符号。
 set(OpenCV_DIR ${OPENCV_SDK}/sdk/native/jni)
 find_package(OpenCV REQUIRED)
+# 诊断：打印 OpenCV_LIBS，确认是否混入静态库组件
+message(STATUS "==== OpenCV_LIBS=${OpenCV_LIBS} ====")
 
 add_library(libsy SHARED
     src/core.cpp
@@ -40,7 +41,15 @@ add_library(libsy SHARED
 )
 
 target_include_directories(libsy PRIVATE include)
-target_link_libraries(libsy PRIVATE ${OpenCV_LIBS} jnigraphics log)
+# 只链接动态单体库 opencv_java4，避免 OpenCV_LIBS 里的静态库组件把大量 OpenCV 代码
+# 静态链入 libsy.so（此前 .text 段 arm64 4.26MB / x86_64 25.44MB，即静态库代码膨胀）。
+# opencv_java4 已含全部模块符号，业务代码所需 OpenCV API 均由其提供。
+if(TARGET opencv_java4)
+    target_link_libraries(libsy PRIVATE opencv_java4 jnigraphics log)
+else()
+    message(WARNING "未找到 opencv_java4 target，回退到 OpenCV_LIBS（可能含静态库）")
+    target_link_libraries(libsy PRIVATE ${OpenCV_LIBS} jnigraphics log)
+endif()
 
 # 产出 libsy.so
 set_target_properties(libsy PROPERTIES OUTPUT_NAME "sy")
