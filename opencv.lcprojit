@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lcprojit projname="opencv" lcprojversion="150" is_acc_mode="0" appname="opencv" pkgname="com.opencv"
+    cpu_x86="1" cpu_x86_64="1" cpu_arm="1" cpu_arm64="1"
+    engine_type="3"
+    opt_runinrootmode_checked="1" opt_forceruninrootmode_checked="1"
+    opt_recorandsavelog_checked="1"
+    vercode="1" vername="0.0.1">
+    <lua entry="opencv.lua"/>
+    <ui entry="opencv.ui"/>
+    <rc entry="opencv.rc"/>
+    <luaej/>
+</lcprojit>

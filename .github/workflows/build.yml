@@ -1,0 +1,92 @@
+name: Build libsy.so (4 ABI)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup NDK
+        id: ndk
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+          test -n "$ANDROID_NDK_HOME"
+          test -f "$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
+          echo "toolchain=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" >> $GITHUB_OUTPUT
+
+      - name: Cache OpenCV Android SDK
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: OpenCV-android-sdk
+          key: opencv-4.5.3-android-sdk-v1
+
+      - name: Download OpenCV 4.5.3 Android SDK
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o opencv-sdk.zip \
+            https://github.com/opencv/opencv/releases/download/4.5.3/opencv-4.5.3-android-sdk.zip
+          unzip -q opencv-sdk.zip
+          rm -f opencv-sdk.zip
+          test -f OpenCV-android-sdk/sdk/native/jni/OpenCVConfig.cmake
+
+      - name: Build all ABIs
+        run: |
+          set -e
+          TOOLCHAIN="${{ steps.ndk.outputs.toolchain }}"
+          OPENCV_SDK="$PWD/OpenCV-android-sdk"
+          ABIS="armeabi-v7a arm64-v8a x86 x86_64"
+          for ABI in $ABIS; do
+            echo "=== Building $ABI ==="
+            cmake -B build-$ABI -S native \
+              -DOPENCV_SDK="$OPENCV_SDK" \
+              -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
+              -DANDROID_ABI="$ABI" \
+              -DANDROID_PLATFORM=android-21 \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build build-$ABI -j$(nproc)
+            mkdir -p "界面/libs/$ABI"
+            cp "build-$ABI/libsy.so" "界面/libs/$ABI/libsy.so"
+          done
+
+      - name: Verify artifacts
+        run: |
+          for ABI in armeabi-v7a arm64-v8a x86 x86_64; do
+            SO="界面/libs/$ABI/libsy.so"
+            test -f "$SO" || { echo "MISSING $SO"; exit 1; }
+            echo "--- $ABI ---"
+            file "$SO"
+            # 确认动态依赖 libopencv_java4.so（不依赖 libengine.so）
+            "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d "$SO" \
+              | grep -E 'NEEDED|SONAME' || true
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libsy-4abi
+          path: 界面/libs/**/libsy.so
+
+      - name: Package release zip
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd 界面/libs
+          zip -r "$GITHUB_WORKSPACE/libsy-4abi.zip" .
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: libsy-4abi.zip
+          generate_release_notes: true

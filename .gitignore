@@ -1,0 +1,28 @@
+# 构建中间产物（本地编译或 Actions 运行产生）
+build-*/
+build/
+OpenCV-android-sdk/
+opencv-sdk.zip
+libsy-4abi.zip
+
+# 编译输出（如本地编译产生的临时 .so；界面/libs/ 下的成品 .so 需保留以供懒人精灵打包）
+*.o
+*.obj
+
+# IDE / 编辑器
+.vscode/
+.idea/
+.vs/
+*.user
+
+# Trae IDE 工作状态
+.trae/
+
+# 操作系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc
