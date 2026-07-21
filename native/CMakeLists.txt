@@ -8,11 +8,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# 体积优化：按段裁剪未引用代码
+# 体积优化：按段裁剪未引用代码 + 链接期 strip 符号表
 # 不使用 -fvisibility=hidden：否则 extern "C" 导出函数不进动态符号表，
 # 懒人精灵 LuaJIT FFI 的 dlsym 将找不到符号（如 screenshot）。
+# -Wl,-s: strip 符号表(.symtab)/字符串表/调试信息；动态符号表(.dynsym)保留，
+#         故 extern "C" 导出函数仍可被 dlsym 找到，FFI 调用不受影响。
 add_compile_options(-ffunction-sections -fdata-sections)
-add_link_options(-Wl,--gc-sections -Wl,--exclude-libs,ALL)
+add_link_options(-Wl,--gc-sections -Wl,--exclude-libs,ALL -Wl,-s)
 
 # OpenCV Android SDK 路径，由 -DOPENCV_SDK=/path/to/OpenCV-android-sdk 传入
 if(NOT DEFINED OPENCV_SDK)

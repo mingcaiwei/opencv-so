@@ -46,6 +46,8 @@ jobs:
           set -e
           TOOLCHAIN="${{ steps.ndk.outputs.toolchain }}"
           OPENCV_SDK="$PWD/OpenCV-android-sdk"
+          STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          test -x "$STRIP"
           ABIS="armeabi-v7a arm64-v8a x86 x86_64"
           for ABI in $ABIS; do
             echo "=== Building $ABI ==="
@@ -56,20 +58,28 @@ jobs:
               -DANDROID_PLATFORM=android-21 \
               -DCMAKE_BUILD_TYPE=Release
             cmake --build build-$ABI -j$(nproc)
+            # strip 符号表/调试信息（-Wl,-s 已在链接期 strip，此处兜底；幂等）
+            # --strip-all 保留动态符号表 .dynsym，extern "C" 导出符号不受影响
+            "$STRIP" --strip-all build-$ABI/libsy.so
             mkdir -p "界面/libs/$ABI"
             cp "build-$ABI/libsy.so" "界面/libs/$ABI/libsy.so"
+            ls -lh "界面/libs/$ABI/libsy.so"
           done
 
       - name: Verify artifacts
         run: |
+          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           for ABI in armeabi-v7a arm64-v8a x86 x86_64; do
             SO="界面/libs/$ABI/libsy.so"
             test -f "$SO" || { echo "MISSING $SO"; exit 1; }
             echo "--- $ABI ---"
+            ls -lh "$SO"
             file "$SO"
             # 确认动态依赖 libopencv_java4.so（不依赖 libengine.so）
-            "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d "$SO" \
-              | grep -E 'NEEDED|SONAME' || true
+            "$READELF" -d "$SO" | grep -E 'NEEDED|SONAME' || true
+            # 确认 strip 后 extern "C" 导出符号仍在动态符号表（FFI dlsym 依赖）
+            "$READELF" --dyn-syms "$SO" | grep -E 'screenshot|loadImage|findImageBySIFT|crop|saveMat' \
+              || { echo "ERROR: 导出符号丢失，FFI 将无法调用"; exit 1; }
           done
 
       - name: Upload artifact
