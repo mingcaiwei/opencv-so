@@ -8,9 +8,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# 体积优化：隐藏符号、按段裁剪
-add_compile_options(-fvisibility=hidden -fvisibility-inlines-hidden
-                    -ffunction-sections -fdata-sections)
+# 体积优化：按段裁剪未引用代码
+# 不使用 -fvisibility=hidden：否则 extern "C" 导出函数不进动态符号表，
+# 懒人精灵 LuaJIT FFI 的 dlsym 将找不到符号（如 screenshot）。
+add_compile_options(-ffunction-sections -fdata-sections)
 add_link_options(-Wl,--gc-sections -Wl,--exclude-libs,ALL)
 
 # OpenCV Android SDK 路径，由 -DOPENCV_SDK=/path/to/OpenCV-android-sdk 传入

@@ -5,7 +5,7 @@
 
 local function main()
     -- 加载 OpenCV 封装库（与本脚本同目录）
-    local ok, cv = pcall(dofile, getWorkPath() .. "/opencvutil.lua")
+    local ok, cv = pcall(require, "opencvutil")
     if not ok or not cv then
         print("✗ 加载 opencvutil 失败: " .. tostring(cv))
         return
