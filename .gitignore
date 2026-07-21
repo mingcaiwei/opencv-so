@@ -26,3 +26,9 @@ desktop.ini
 # Python
 __pycache__/
 *.pyc
+
+# 懒人精灵运行时产物（不应进仓库）
+cache/
+debug.log
+*.log
+_*.png

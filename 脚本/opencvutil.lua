@@ -215,11 +215,26 @@ end
 -- @param y1: 右下角y坐标
 -- @return: 截图图像(Mat)
 function OpenCV.screenshot(x, y, x1, y1)
-    local result = cv_lib.screenshot(x, y, x1, y1)
-    if not isValid(result) then
-        error("screenshot: 截图失败")
+    -- 用懒人精灵原生 snapShot(path) 全屏截图存文件，C 层 loadImage 读取后裁剪。
+    -- 绕过 JNI 截图在 native 线程 FindClass 的 ClassLoader 兼容问题。
+    local tmpPath = getWorkPath() .. "/_snap_tmp.png"
+    snapShot(tmpPath)
+    local full = cv_lib.loadImage(tmpPath)
+    os.remove(tmpPath) -- imread 已读入内存，删除临时文件
+    if not isValid(full) then
+        error("screenshot: 截图失败（snapShot 未生成图片或 loadImage 失败，检查截图服务/root权限）")
     end
-    return result
+    local w = x1 - x
+    local h = y1 - y
+    if w > 0 and h > 0 then
+        local cropped = cv_lib.crop(full, x, y, w, h)
+        cv_lib.releaseMat(full)
+        if not isValid(cropped) then
+            error("screenshot: 区域裁剪失败")
+        end
+        return cropped
+    end
+    return full
 end
 
 -- 加载图像文件
