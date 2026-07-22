@@ -1286,15 +1286,12 @@ local function _doMatch(scene, tpl, method, threshold, regX, regY)
         local bs = ffi.new("double[1]")
         cv_lib.templateMatchMultiScale(scene, tpl, OpenCV.TM_CCOEFF_NORMED,
             OpenCV.SCALE_START, OpenCV.SCALE_END, OpenCV.SCALE_STEP, bx, by, mv, bs)
-        -- 模板匹配返回左上角坐标 + 最佳缩放，阈值是相似度(0~1)
+        -- C 层 templateMatchMultiScale 已返回中心坐标（loc + resized/2），阈值是相似度(0~1)
         local thr = threshold or 0.8
         local bxv, byv, mvv, bsv = tonumber(bx[0]), tonumber(by[0]), tonumber(mv[0]), tonumber(bs[0])
         if bxv >= 0 and byv >= 0 and mvv >= thr then
-            -- 缩放后模板实际尺寸，加一半得到中心点
-            local realW = tonumber(cv_lib.getMatWidth(tpl)) * bsv
-            local realH = tonumber(cv_lib.getMatHeight(tpl)) * bsv
-            result.x = bxv + realW / 2 + regX
-            result.y = byv + realH / 2 + regY
+            result.x = bxv + regX
+            result.y = byv + regY
             result.confidence = mvv
             result.scale = bsv
             result.found = true
