@@ -1,7 +1,12 @@
 // 截图实现：通过 JNI_GetCreatedJavaVMs 获取懒人精灵进程的 JavaVM，
 // 调用 com.nx.assist.lua.LuaEngine.snapShot(IIII)Landroid/graphics/Bitmap;
 // 再用 AndroidBitmap_lockPixels 把像素转为 cv::Mat。
-// 这样不依赖 libengine.so，完全独立。
+//
+// 关键坑：.so 由 LuaJIT ffi.load(dlopen) 加载，调用截图的线程是 native 线程，
+// AttachCurrentThread 后 FindClass 用【系统 ClassLoader】，找不到应用类 com/nx/assist/lua/LuaEngine。
+// 修复：先用 FindClass 兜底（线程已带应用 ClassLoader 时直接成功），失败则回退到
+//       Thread.currentThread().getContextClassLoader().loadClass() 加载应用类。
+//       java/lang/Thread、java/lang/ClassLoader、android/graphics/Bitmap 是系统/框架类，FindClass 可用。
 #include "common.h"
 
 #include <jni.h>
@@ -36,6 +41,76 @@ static JavaVM *getJavaVM()
     return vm;
 }
 
+// 缓存：LuaEngine 类 + snapShot 方法 + Bitmap.recycle 方法，避免每次截图重复查找
+static jclass    g_luaEngineCls = nullptr;
+static jmethodID g_snapMid      = nullptr;
+static jmethodID g_recycleMid   = nullptr;
+
+// 在 FFI native 线程上解析应用类 com.nx.assist.lua.LuaEngine。
+// 先 FindClass（线程已带应用 ClassLoader 时直接成功），失败回退到 context ClassLoader。
+static bool resolveLuaEngine(JNIEnv *env)
+{
+    if (g_luaEngineCls && g_snapMid)
+        return true;
+
+    jclass cls = env->FindClass("com/nx/assist/lua/LuaEngine");
+    if (!cls)
+    {
+        env->ExceptionClear();
+        // 回退：Thread.currentThread().getContextClassLoader().loadClass(...)
+        jclass threadCls = env->FindClass("java/lang/Thread");
+        if (!threadCls) { env->ExceptionClear(); return false; }
+        jmethodID curMid       = env->GetStaticMethodID(threadCls, "currentThread", "()Ljava/lang/Thread;");
+        jmethodID getCtxLoader = env->GetMethodID(threadCls, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+        if (!curMid || !getCtxLoader) { env->DeleteLocalRef(threadCls); return false; }
+
+        jobject thread = env->CallStaticObjectMethod(threadCls, curMid);
+        env->DeleteLocalRef(threadCls);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!thread) return false;
+
+        jobject loader = env->CallObjectMethod(thread, getCtxLoader);
+        env->DeleteLocalRef(thread);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!loader) return false;
+
+        jclass loaderCls = env->FindClass("java/lang/ClassLoader");
+        if (!loaderCls) { env->ExceptionClear(); env->DeleteLocalRef(loader); return false; }
+        jmethodID loadClass = env->GetMethodID(loaderCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+        env->DeleteLocalRef(loaderCls);
+        if (!loadClass) { env->DeleteLocalRef(loader); return false; }
+
+        jstring name = env->NewStringUTF("com.nx.assist.lua.LuaEngine");
+        cls = (jclass)env->CallObjectMethod(loader, loadClass, name);
+        env->DeleteLocalRef(name);
+        env->DeleteLocalRef(loader);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (!cls) return false;
+    }
+
+    jmethodID mid = env->GetStaticMethodID(cls, "snapShot", "(IIII)Landroid/graphics/Bitmap;");
+    if (!mid)
+    {
+        env->ExceptionClear();
+        env->DeleteLocalRef(cls);
+        return false;
+    }
+
+    // Bitmap.recycle() 用于立即释放原生像素内存（文档要求释放，避免截图循环内存堆积）
+    jclass bmpCls = env->FindClass("android/graphics/Bitmap");
+    if (bmpCls)
+    {
+        g_recycleMid = env->GetMethodID(bmpCls, "recycle", "()V");
+        env->DeleteLocalRef(bmpCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+
+    g_luaEngineCls = (jclass)env->NewGlobalRef(cls);
+    g_snapMid = mid;
+    env->DeleteLocalRef(cls);
+    return true;
+}
+
 void *screenshotImpl(int x, int y, int x1, int y1)
 {
     static JavaVM *vm = nullptr;
@@ -59,42 +134,36 @@ void *screenshotImpl(int x, int y, int x1, int y1)
     void *result = nullptr;
     do
     {
-        jclass cls = env->FindClass("com/nx/assist/lua/LuaEngine");
-        if (!cls)
+        if (!resolveLuaEngine(env))
         {
-            LOGE("LuaEngine class not found");
-            break;
-        }
-        jmethodID mid = env->GetStaticMethodID(cls, "snapShot", "(IIII)Landroid/graphics/Bitmap;");
-        if (!mid)
-        {
-            LOGE("snapShot method not found");
-            env->DeleteLocalRef(cls);
+            LOGE("LuaEngine 解析失败（FindClass 与 contextClassLoader 均失败）");
             break;
         }
 
-        jobject bmp = env->CallStaticObjectMethod(cls, mid, (jint)x, (jint)y, (jint)x1, (jint)y1);
-        env->DeleteLocalRef(cls);
+        jobject bmp = env->CallStaticObjectMethod(g_luaEngineCls, g_snapMid,
+                                                   (jint)x, (jint)y, (jint)x1, (jint)y1);
         if (env->ExceptionCheck())
         {
             env->ExceptionClear();
-            LOGE("LuaEngine.snapShot threw exception");
+            LOGE("LuaEngine.snapShot 抛出异常（截图服务未开启?）");
         }
         if (!bmp)
         {
-            LOGE("snapShot returned null bitmap (截图服务未开启?)");
+            LOGE("snapShot 返回 null bitmap");
             break;
         }
 
         AndroidBitmapInfo info;
         if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
         {
+            if (g_recycleMid) env->CallVoidMethod(bmp, g_recycleMid);
             env->DeleteLocalRef(bmp);
             break;
         }
         void *pixels = nullptr;
         if (AndroidBitmap_lockPixels(env, bmp, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
         {
+            if (g_recycleMid) env->CallVoidMethod(bmp, g_recycleMid);
             env->DeleteLocalRef(bmp);
             break;
         }
@@ -117,6 +186,14 @@ void *screenshotImpl(int x, int y, int x1, int y1)
             cv::cvtColor(rgba, *mat, cv::COLOR_RGBA2BGR);
         }
         AndroidBitmap_unlockPixels(env, bmp);
+
+        // 立即回收 Bitmap 原生像素内存（cvtColor 已拷贝像素到独立 Mat，回收安全）
+        if (g_recycleMid)
+        {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            env->CallVoidMethod(bmp, g_recycleMid);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
         env->DeleteLocalRef(bmp);
 
         if (mat->empty())

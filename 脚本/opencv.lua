@@ -73,7 +73,7 @@ local function main()
     end
 
     -- 更多高层用法（按需取消注释，部分会真实操作屏幕）：
-    -- cv.findImageAndClick(tmplPath, nil, 100.0)              -- 找图并点击
+    --cv.findImageAndClick(tmplPath, nil, 100.0)              -- 找图并点击
     -- cv.clickIfFound(tmplPath, nil, 100.0)                   -- 简化找图点击
     -- cv.waitForImage(tmplPath, 5000, 500)                    -- 等待出现（5秒超时）
     -- cv.waitForImageAndClick(tmplPath, 5000, 500)            -- 等待并点击
