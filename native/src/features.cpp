@@ -77,7 +77,7 @@ bool locateTemplateSIFT(const cv::Mat &sceneDesc, const std::vector<cv::KeyPoint
                         const cv::Mat &tmplMat, double threshold,
                         double *cx, double *cy, double *conf, int *good_count)
 {
-    cv::Ptr<cv::SIFT> sift = cv::SIFT::create();
+    cv::Ptr<cv::SIFT> sift = cv::SIFT::create(800);
     return locateTemplateImpl(sceneDesc, sceneKp, tmplMat, threshold, cv::NORM_L2,
                               sift.get(), cx, cy, conf, good_count);
 }
@@ -100,7 +100,7 @@ void *detectSIFT(void *src, int *keypoint_count)
     if (keypoint_count) *keypoint_count = 0;
     if (!isValidMat(src))
         return nullptr;
-    cv::Ptr<cv::SIFT> sift = cv::SIFT::create();
+    cv::Ptr<cv::SIFT> sift = cv::SIFT::create(800);
     std::vector<cv::KeyPoint> kp;
     cv::Mat *desc = new cv::Mat();
     sift->detectAndCompute(*toMat(src), cv::noArray(), kp, *desc);
@@ -156,7 +156,7 @@ void findImageBySIFT(void *scene, void *template_img, double threshold,
         g_lastMatch = {0, 0, 0};
         return;
     }
-    cv::Ptr<cv::SIFT> sift = cv::SIFT::create();
+    cv::Ptr<cv::SIFT> sift = cv::SIFT::create(800);
     std::vector<cv::KeyPoint> sceneKp;
     cv::Mat sceneDesc;
     sift->detectAndCompute(*toMat(scene), cv::noArray(), sceneKp, sceneDesc);

@@ -89,7 +89,61 @@ local function main()
 end
 
 -- 全局保护：任何错误都打印而不崩溃
-local ok, err = pcall(main)
+--[===[local ok, err = pcall(main)
 if not ok then
     print("✗ 执行出错: " .. tostring(err))
+end]===]
+
+
+-- 截图并查找模板
+-- @param tplPath: 模板图片路径
+-- @param region: 搜索区域，nil=全屏，或 {x,y,x1,y1} / {x=,y=,x1=,y1=}
+-- @param threshold: 匹配阈值
+-- @param method: 匹配方法，默认 OpenCV.MATCH_SIFT
+-- @param useCache: 是否缓存模板，默认 true
+-- @return: {x, y, confidence, found, method, region}，x,y 为屏幕绝对坐标（匹配中心点）
+
+-- ========== findImage 调用示例 ==========
+-- findImage 会自动截图 + 匹配，返回屏幕绝对坐标（匹配中心点）
+-- 返回值: { x, y, confidence, found, method, region }
+--   confidence: SIFT/ORB 为 0-100 匹配率；TEMPLATE 为 0-1 相似度
+
+local cv = require("opencvutil")
+
+local work = getWorkPath()
+local tplPath = work .. "/1.png"   -- 模板图片（放入 opencv.rc 资源包即可，findImage 会自动解压）
+
+
+-- 示例 1：全屏 SIFT 找图
+-- threshold=100 是 SIFT 描述子距离阈值（越小越严格，100 较宽松）
+local r1 = cv.findImage(tplPath, nil, 100.0, cv.MATCH_SIFT)
+if r1 and r1.found then
+    print(string.format("✓ SIFT 全屏找到: 中心(%d, %d) 匹配率=%.1f%%", r1.x, r1.y, r1.confidence))
+else
+    print("✗ SIFT 全屏未找到（确认 template.png 已放入 work 目录）")
 end
+
+-- 示例 2：指定区域模板匹配
+-- region = {左, 上, 右, 下}；threshold=0.8 即 80% 相似度
+local tick = tickCount()
+print(tick)
+local r2 = cv.findImage(tplPath, {52,1635,261,1870}, 0.8, cv.MATCH_TEMPLATE)
+if r2 and r2.found then
+    print(string.format("✓ 模板匹配区域内找到: 中心(%d, %d) 相似度=%.1f%%", r2.x, r2.y, r2.confidence * 100))
+else
+    print("✗ 指定区域内未找到模板")
+end
+local tick2 = tickCount()
+
+print(tick2-tick)
+
+-- 示例 3：找图并点击（一行搞定，默认 SIFT + 普通点击）
+-- cv.findImageAndClick(tplPath, nil, 100.0)
+
+-- 示例 4：指定区域找图并长按
+-- cv.findImageAndClick(tplPath, {553, 1057, 794, 1237}, 100.0, cv.MATCH_SIFT, cv.CLICK_LONG)
+
+
+
+
+

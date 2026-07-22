@@ -193,6 +193,12 @@ OpenCV.STITCH_SIFT = 0
 OpenCV.STITCH_ORB = 1
 OpenCV.STITCH_TEMPLATE = 2
 
+-- 模板匹配多尺度参数（可调：范围越小越快，0.8~1.2 步长0.1 = 5个尺度，够大多数场景）
+-- 若模板与截图比例差异大，可放宽如 OpenCV.SCALE_START=0.5 OpenCV.SCALE_END=2.0
+OpenCV.SCALE_START = 0.8
+OpenCV.SCALE_END   = 1.2
+OpenCV.SCALE_STEP  = 0.1
+
 -- 辅助函数
 local function isValid(ptr)
     return ptr ~= nil and ptr ~= ffi.cast("void*", 0)
@@ -1216,11 +1222,20 @@ end
 
 -- 内部：加载模板（带缓存）
 -- useCache 默认 true；返回 Mat 或 nil
+-- 文件不存在时自动从 opencv.rc 资源包解压后重试（仅一次，避免重复 IO）
+local _rcExtracted = false
 local function _loadTemplate(tplPath, useCache)
     if useCache ~= false and _tplCache[tplPath] then
         return _tplCache[tplPath]
     end
     local tpl = cv_lib.loadImage(tplPath)
+    -- 加载失败：尝试从 opencv.rc 资源包解压到模板所在目录后重试
+    if not isValid(tpl) and not _rcExtracted then
+        _rcExtracted = true
+        local dir = tplPath:match("(.+)[/\\][^/\\]+$") or getWorkPath()
+        pcall(extractAssets, "opencv.rc", dir .. "/", "*.*")
+        tpl = cv_lib.loadImage(tplPath)
+    end
     if not isValid(tpl) then
         return nil
     end
@@ -1270,7 +1285,7 @@ local function _doMatch(scene, tpl, method, threshold, regX, regY)
         local mv = ffi.new("double[1]")
         local bs = ffi.new("double[1]")
         cv_lib.templateMatchMultiScale(scene, tpl, OpenCV.TM_CCOEFF_NORMED,
-            0.5, 2.0, 0.1, bx, by, mv, bs)
+            OpenCV.SCALE_START, OpenCV.SCALE_END, OpenCV.SCALE_STEP, bx, by, mv, bs)
         -- 模板匹配返回左上角坐标 + 最佳缩放，阈值是相似度(0~1)
         local thr = threshold or 0.8
         local bxv, byv, mvv, bsv = tonumber(bx[0]), tonumber(by[0]), tonumber(mv[0]), tonumber(bs[0])
