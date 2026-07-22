@@ -10,6 +10,8 @@ local ffi = require("ffi")
 ffi.cdef [[
     // 基础图像操作
     void* screenshot(int x, int y, int x1, int y1);
+    const char* getScreenshotError();
+    const char* dumpLuaEngineMethods();
     void* loadImage(const char* filepath);
     int saveMat(void* mat_ptr, const char* filepath);
     void releaseMat(void* mat_ptr);
@@ -199,6 +201,13 @@ OpenCV.SCALE_START = 0.8
 OpenCV.SCALE_END   = 1.2
 OpenCV.SCALE_STEP  = 0.1
 
+-- 调试开关：设 true 打印截图/匹配耗时，定位性能瓶颈用
+OpenCV.DEBUG = false
+-- 文件法截图格式：true=JPEG(编码快3-5倍,有损)，false=PNG(无损,慢)；JPEG 不支持时自动回退 PNG
+local _snapUseJpeg = true
+-- JNI 截图方法列表是否已 dump 过（避免每次截图都 dump）
+local _dumpedMethods = false
+
 -- 辅助函数
 local function isValid(ptr)
     return ptr ~= nil and ptr ~= ffi.cast("void*", 0)
@@ -221,28 +230,67 @@ end
 -- @param y1: 右下角y坐标
 -- @return: 截图图像(Mat)
 function OpenCV.screenshot(x, y, x1, y1)
-    -- 优先用 C 层 JNI 截图（已修复 native 线程 ClassLoader，直接返回 Mat，无文件 I/O、原生区域裁剪）
-    -- 失败则回退到 snapShot(path) 存文件 + loadImage 读回 + crop，兼容旧 .so 或截图服务异常
-    local ok, mat = pcall(cv_lib.screenshot, x or 0, y or 0, x1 or 0, y1 or 0)
+    x = x or 0; y = y or 0; x1 = x1 or 0; y1 = y1 or 0
+    local t0 = OpenCV.DEBUG and tickCount() or 0
+
+    -- 路径 1：C 层 JNI 截图（已修复 native 线程 ClassLoader，直接返回 Mat，无文件 I/O、原生区域裁剪）
+    -- 耗时约 20-40ms，是提速关键。需要 cf82f51 之后编译的 .so
+    local ok, mat = pcall(cv_lib.screenshot, x, y, x1, y1)
     if ok and isValid(mat) then
+        if OpenCV.DEBUG then
+            print(string.format("[screenshot] JNI 截图 %dms (%d,%d,%d,%d)",
+                tickCount() - t0, x, y, x1, y1))
+        end
         return mat
     end
+    if OpenCV.DEBUG then
+        local err = "unknown"
+        pcall(function() err = cv_lib.getScreenshotError() or "unknown" end)
+        print(string.format("[screenshot] JNI 失败: %s", err))
+        -- 首次失败时 dump LuaEngine 方法列表，帮助定位正确的截图方法名
+        if not _dumpedMethods then
+            _dumpedMethods = true
+            local ok2, methods = pcall(cv_lib.dumpLuaEngineMethods)
+            if ok2 and methods and #methods > 0 then
+                print("[screenshot] LuaEngine 截图相关方法:\n" .. methods)
+            end
+        end
+    end
 
-    -- 回退：懒人精灵原生 snapShot(path) 全屏截图存文件，C 层 loadImage 读取后裁剪
-    local tmpPath = getWorkPath() .. "/_snap_tmp.png"
+    -- 路径 2：文件法（snapShot 存文件 + loadImage 读回 + crop）
+    -- JPEG 编码比 PNG 快 3-5 倍；不支持时自动回退 PNG
+    local ext = _snapUseJpeg and ".jpg" or ".png"
+    local tmpPath = getWorkPath() .. "/_snap_tmp" .. ext
     snapShot(tmpPath)
     local full = cv_lib.loadImage(tmpPath)
-    os.remove(tmpPath) -- imread 已读入内存，删除临时文件
-    if not isValid(full) then
-        error("screenshot: 截图失败（JNI 截图与 snapShot 文件法均失败，检查截图服务/root权限）")
+    if not isValid(full) and _snapUseJpeg then
+        os.remove(tmpPath)
+        _snapUseJpeg = false
+        ext = ".png"
+        tmpPath = getWorkPath() .. "/_snap_tmp.png"
+        snapShot(tmpPath)
+        full = cv_lib.loadImage(tmpPath)
     end
-    local w = (x1 or 0) - (x or 0)
-    local h = (y1 or 0) - (y or 0)
+    os.remove(tmpPath)
+    if not isValid(full) then
+        error("screenshot: 截图失败（JNI 与文件法均失败，检查截图服务/root权限）")
+    end
+    if OpenCV.DEBUG then
+        print(string.format("[screenshot] 文件法(%s) 全屏截图+读取 %dms",
+            ext, tickCount() - t0))
+    end
+
+    -- 区域裁剪
+    local w = x1 - x
+    local h = y1 - y
     if w > 0 and h > 0 then
         local cropped = cv_lib.crop(full, x, y, w, h)
         cv_lib.releaseMat(full)
         if not isValid(cropped) then
             error("screenshot: 区域裁剪失败")
+        end
+        if OpenCV.DEBUG then
+            print(string.format("[screenshot] 裁剪区域 %dx%d 总耗时 %dms", w, h, tickCount() - t0))
         end
         return cropped
     end
@@ -1253,6 +1301,7 @@ local function _doMatch(scene, tpl, method, threshold, regX, regY)
         return result
     end
     method = method or OpenCV.MATCH_SIFT
+    local t0 = OpenCV.DEBUG and tickCount() or 0
 
     if method == OpenCV.MATCH_SIFT then
         local cx = ffi.new("double[1]")
@@ -1284,8 +1333,21 @@ local function _doMatch(scene, tpl, method, threshold, regX, regY)
         local by = ffi.new("double[1]")
         local mv = ffi.new("double[1]")
         local bs = ffi.new("double[1]")
-        cv_lib.templateMatchMultiScale(scene, tpl, OpenCV.TM_CCOEFF_NORMED,
+        -- 转灰度加速：彩色 3 通道 matchTemplate 慢 3 倍，UI 找图灰度足够
+        local matchScene, matchTpl = scene, tpl
+        local tmpScene, tmpTpl
+        if cv_lib.getMatChannels(scene) > 1 then
+            tmpScene = cv_lib.convertToGray(scene)
+            if isValid(tmpScene) then matchScene = tmpScene end
+        end
+        if cv_lib.getMatChannels(tpl) > 1 then
+            tmpTpl = cv_lib.convertToGray(tpl)
+            if isValid(tmpTpl) then matchTpl = tmpTpl end
+        end
+        cv_lib.templateMatchMultiScale(matchScene, matchTpl, OpenCV.TM_CCOEFF_NORMED,
             OpenCV.SCALE_START, OpenCV.SCALE_END, OpenCV.SCALE_STEP, bx, by, mv, bs)
+        if tmpScene then cv_lib.releaseMat(tmpScene) end
+        if tmpTpl then cv_lib.releaseMat(tmpTpl) end
         -- C 层 templateMatchMultiScale 已返回中心坐标（loc + resized/2），阈值是相似度(0~1)
         local thr = threshold or 0.8
         local bxv, byv, mvv, bsv = tonumber(bx[0]), tonumber(by[0]), tonumber(mv[0]), tonumber(bs[0])
@@ -1303,6 +1365,12 @@ local function _doMatch(scene, tpl, method, threshold, regX, regY)
     if result.found then
         result.x = math.floor(result.x + 0.5)
         result.y = math.floor(result.y + 0.5)
+    end
+    if OpenCV.DEBUG then
+        print(string.format("[_doMatch] %s 匹配 %dms found=%s",
+            method == OpenCV.MATCH_SIFT and "SIFT" or
+            (method == OpenCV.MATCH_ORB and "ORB" or "TEMPLATE"),
+            tickCount() - t0, tostring(result.found)))
     end
     return result
 end
