@@ -16,12 +16,21 @@
 #include <android/bitmap.h>
 #include <dlfcn.h>
 #include <elf.h>
+#include <link.h>   // ElfW 宏定义在此（bionic 的 elf.h 不含 ElfW）
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <cinttypes>
 #include <vector>
 #include <string>
+
+// 兜底：如果 link.h 仍未定义 ElfW，用手动定义
+#ifndef ElfW
+#if defined(__LP64__)
+#define ElfW(type) Elf64_##type
+#else
+#define ElfW(type) Elf32_##type
+#endif
+#endif
 
 using GetCreatedJavaVMs_t = jint (*)(JavaVM **, jsize, jsize *);
 
@@ -50,7 +59,9 @@ static void *findSymbolInLib(const char *libname, const char *symname)
         {
             // 行格式：地址范围 权限 偏移 ... 路径
             // 例如：7b1234000-7b1245000 r--p 00000000 ... libart.so
-            sscanf(line, "%" SCNxPTR, &base_addr);
+            unsigned long addr_val = 0;
+            sscanf(line, "%lx", &addr_val);
+            base_addr = (uintptr_t)addr_val;
             break;
         }
     }
