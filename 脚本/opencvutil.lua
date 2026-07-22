@@ -245,14 +245,20 @@ function OpenCV.screenshot(x, y, x1, y1)
     end
     if OpenCV.DEBUG then
         local err = "unknown"
-        pcall(function() err = cv_lib.getScreenshotError() or "unknown" end)
+        pcall(function()
+            local p = cv_lib.getScreenshotError()
+            if p then err = ffi.string(p) end
+        end)
         print(string.format("[screenshot] JNI 失败: %s", err))
         -- 首次失败时 dump LuaEngine 方法列表，帮助定位正确的截图方法名
         if not _dumpedMethods then
             _dumpedMethods = true
             local ok2, methods = pcall(cv_lib.dumpLuaEngineMethods)
-            if ok2 and methods and #methods > 0 then
-                print("[screenshot] LuaEngine 截图相关方法:\n" .. methods)
+            if ok2 and methods then
+                local s = ffi.string(methods)
+                if s and #s > 0 then
+                    print("[screenshot] LuaEngine 截图相关方法:\n" .. s)
+                end
             end
         end
     end

@@ -1,12 +1,17 @@
-// 截图实现：通过 JNI_GetCreatedJavaVMs 获取懒人精灵进程的 JavaVM，
-// 调用 com.nx.assist.lua.LuaEngine.snapShot(IIII)Landroid/graphics/Bitmap;
-// 再用 AndroidBitmap_lockPixels 把像素转为 cv::Mat。
+// 截图实现：三种路径，按速度优先级尝试
+//
+// 路径 1：JNI 截图（~30ms）— 通过 JavaVM 调 LuaEngine.snapShot(IIII) 返回 Bitmap
+//   需要 getJavaVM 成功。Android 7+ 的 namespace 限制可能导致 dlopen("libart.so") 失败，
+//   用 RTLD_DEFAULT 绕过 + 多路径 dlopen 兜底。
+//
+// 路径 2：screencap 命令截图（~50ms）— popen("screencap") 读取 raw RGBA，imdecode 不需要
+//   无文件 I/O、无 PNG 编解码，root 模式可用，不依赖 JavaVM
+//
+// 路径 3：返回 nullptr，Lua 屄走 snapShot(path) 文件法（~175ms）
 //
 // 关键坑：.so 由 LuaJIT ffi.load(dlopen) 加载，调用截图的线程是 native 线程，
-// AttachCurrentThread 后 FindClass 用【系统 ClassLoader】，找不到应用类 com/nx/assist/lua/LuaEngine。
-// 修复：先用 FindClass 兜底（线程已带应用 ClassLoader 时直接成功），失败则回退到
-//       Thread.currentThread().getContextClassLoader().loadClass() 加载应用类。
-//       java/lang/Thread、java/lang/ClassLoader、android/graphics/Bitmap 是系统/框架类，FindClass 可用。
+// AttachCurrentThread 后 FindClass 用【系统 ClassLoader】，找不到应用类。
+// 修复：先 FindClass 兜底，失败回退到 Thread.currentThread().getContextClassLoader().loadClass()。
 #include "common.h"
 
 #include <jni.h>
@@ -14,6 +19,7 @@
 #include <dlfcn.h>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 using GetCreatedJavaVMs_t = jint (*)(JavaVM **, jsize, jsize *);
 
@@ -22,18 +28,37 @@ static char g_lastError[256] = "no error";
 
 static JavaVM *getJavaVM()
 {
-    void *handle = dlopen("libart.so", RTLD_NOW);
-    if (!handle)
-        handle = dlopen("libdvm.so", RTLD_NOW);
-    if (!handle)
-    {
-        LOGE("dlopen libart.so failed");
-        return nullptr;
-    }
-    auto fn = (GetCreatedJavaVMs_t)dlsym(handle, "JNI_GetCreatedJavaVMs");
+    auto fn = (GetCreatedJavaVMs_t)nullptr;
+
+    // 方式 1：RTLD_DEFAULT 在所有已加载库中查找（绕过 Android 7+ namespace 限制）
+    // libart.so 由 Android 运行时加载，符号已在进程符号空间中
+    fn = (GetCreatedJavaVMs_t)dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs");
+
+    // 方式 2：dlopen 多个可能的 libart.so 路径（旧 Android 或 RTLD_DEFAULT 失败时）
     if (!fn)
     {
-        LOGE("JNI_GetCreatedJavaVMs symbol not found");
+        const char *paths[] = {
+            "libart.so",
+            "/system/lib64/libart.so",
+            "/system/lib/libart.so",
+            "/apex/com.android.art/lib64/libart.so",
+            "/apex/com.android.art/lib/libart.so",
+            "libdvm.so",
+        };
+        for (auto path : paths)
+        {
+            void *handle = dlopen(path, RTLD_NOW);
+            if (handle)
+            {
+                fn = (GetCreatedJavaVMs_t)dlsym(handle, "JNI_GetCreatedJavaVMs");
+                if (fn) break;
+            }
+        }
+    }
+
+    if (!fn)
+    {
+        LOGE("JNI_GetCreatedJavaVMs not found (RTLD_DEFAULT + libart.so paths all failed)");
         return nullptr;
     }
     JavaVM *vm = nullptr;
@@ -47,7 +72,6 @@ static JavaVM *getJavaVM()
 }
 
 // 通过 Thread.currentThread().getContextClassLoader().loadClass(name) 加载类
-// 用于 FindClass 在 native 线程找不到应用类时的回退
 static jclass findClassViaContextLoader(JNIEnv *env, const char *name)
 {
     jclass threadCls = env->FindClass("java/lang/Thread");
@@ -80,7 +104,7 @@ static jclass findClassViaContextLoader(JNIEnv *env, const char *name)
     return cls;
 }
 
-// 缓存：LuaEngine 类 + snapShot 方法 + Bitmap.recycle 方法，避免每次截图重复查找
+// 缓存：LuaEngine 类 + snapShot 方法 + Bitmap.recycle 方法
 static jclass    g_luaEngineCls = nullptr;
 static jmethodID g_snapMid      = nullptr;
 static jmethodID g_recycleMid   = nullptr;
@@ -114,7 +138,6 @@ static bool resolveLuaEngine(JNIEnv *env)
         return false;
     }
 
-    // Bitmap.recycle() 用于立即释放原生像素内存（文档要求释放，避免截图循环内存堆积）
     jclass bmpCls = env->FindClass("android/graphics/Bitmap");
     if (bmpCls)
     {
@@ -130,125 +153,243 @@ static bool resolveLuaEngine(JNIEnv *env)
     return true;
 }
 
-void *screenshotImpl(int x, int y, int x1, int y1)
+// 路径 2：screencap 命令截图（root 模式，无需 JavaVM）
+// screencap 不加 -p 输出 raw 数据：头部4个int(width,height,stride,format) + 像素数据
+// format: 1=RGBA_8888(4字节), 2=RGB_565(2字节)
+static void *screenshotViaScreencap(int x, int y, int x1, int y1)
 {
-    static JavaVM *vm = nullptr;
-    if (!vm)
-        vm = getJavaVM();
-    if (!vm)
+    FILE *fp = popen("screencap", "r");
+    if (!fp)
     {
-        snprintf(g_lastError, sizeof(g_lastError), "getJavaVM失败(dlopen libart.so或JNI_GetCreatedJavaVMs)");
+        snprintf(g_lastError, sizeof(g_lastError), "screencap: popen失败(非root?)");
         return nullptr;
     }
 
-    JNIEnv *env = nullptr;
-    bool attached = false;
-    if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK)
+    // 读取头部：width, height, stride, format
+    int header[4] = {0, 0, 0, 0};
+    if (fread(header, sizeof(int), 4, fp) != 4 || header[0] <= 0 || header[1] <= 0)
     {
-        if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+        pclose(fp);
+        snprintf(g_lastError, sizeof(g_lastError), "screencap: 读取头部失败");
+        return nullptr;
+    }
+    int width  = header[0];
+    int height = header[1];
+    int stride = header[2] > 0 ? header[2] : width;
+    int format = header[3]; // 1=RGBA_8888, 2=RGB_565
+
+    int bpp = (format == 2) ? 2 : 4;
+    size_t rowBytes   = (size_t)width  * bpp;
+    size_t strideBytes = (size_t)stride * bpp;
+    size_t pixelSize  = (size_t)height * rowBytes;
+
+    std::vector<uchar> data(pixelSize);
+
+    if (stride == width)
+    {
+        // stride == width，直接读取所有像素
+        size_t read = 0;
+        while (read < pixelSize)
         {
-            LOGE("AttachCurrentThread failed");
-            snprintf(g_lastError, sizeof(g_lastError), "AttachCurrentThread失败");
+            size_t n = fread(data.data() + read, 1, pixelSize - read, fp);
+            if (n == 0) break;
+            read += n;
+        }
+        pclose(fp);
+        if (read < pixelSize)
+        {
+            snprintf(g_lastError, sizeof(g_lastError), "screencap: 像素数据不完整(%zu/%zu)", read, pixelSize);
             return nullptr;
         }
-        attached = true;
+    }
+    else
+    {
+        // stride != width，逐行读取（跳过每行末尾 padding）
+        std::vector<uchar> row(strideBytes);
+        bool ok = true;
+        for (int r = 0; r < height; r++)
+        {
+            if (fread(row.data(), 1, strideBytes, fp) != strideBytes) { ok = false; break; }
+            memcpy(data.data() + (size_t)r * rowBytes, row.data(), rowBytes);
+        }
+        pclose(fp);
+        if (!ok)
+        {
+            snprintf(g_lastError, sizeof(g_lastError), "screencap: 逐行读取失败(stride=%d)", stride);
+            return nullptr;
+        }
     }
 
-    void *result = nullptr;
-    do
+    // 转换为 cv::Mat
+    cv::Mat *mat = new cv::Mat();
+    if (format == 2) // RGB_565
     {
-        if (!resolveLuaEngine(env))
-        {
-            LOGE("LuaEngine 解析失败: %s", g_lastError);
-            break;
-        }
+        cv::Mat rgb565(height, width, CV_8UC2, data.data());
+        cv::cvtColor(rgb565, *mat, cv::COLOR_BGR5652BGR);
+    }
+    else // RGBA_8888（最常见）
+    {
+        cv::Mat rgba(height, width, CV_8UC4, data.data());
+        cv::cvtColor(rgba, *mat, cv::COLOR_RGBA2BGR);
+    }
 
-        jobject bmp = env->CallStaticObjectMethod(g_luaEngineCls, g_snapMid,
-                                                   (jint)x, (jint)y, (jint)x1, (jint)y1);
-        if (env->ExceptionCheck())
-        {
-            env->ExceptionClear();
-            snprintf(g_lastError, sizeof(g_lastError), "LuaEngine.snapShot抛异常(截图服务未开启?)");
-            LOGE("LuaEngine.snapShot 抛出异常");
-        }
-        if (!bmp)
-        {
-            snprintf(g_lastError, sizeof(g_lastError), "snapShot返回null(截图服务未开启或坐标越界)");
-            LOGE("snapShot 返回 null bitmap");
-            break;
-        }
+    if (mat->empty())
+    {
+        delete mat;
+        snprintf(g_lastError, sizeof(g_lastError), "screencap: cvtColor后Mat为空");
+        return nullptr;
+    }
 
-        AndroidBitmapInfo info;
-        if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
+    // 区域裁剪
+    if (x1 > x && y1 > y)
+    {
+        cv::Rect roi(x, y, x1 - x, y1 - y);
+        if (roi.x >= 0 && roi.y >= 0 &&
+            roi.x + roi.width <= mat->cols &&
+            roi.y + roi.height <= mat->rows)
         {
-            snprintf(g_lastError, sizeof(g_lastError), "AndroidBitmap_getInfo失败");
-            if (g_recycleMid) env->CallVoidMethod(bmp, g_recycleMid);
-            env->DeleteLocalRef(bmp);
-            break;
-        }
-        void *pixels = nullptr;
-        if (AndroidBitmap_lockPixels(env, bmp, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
-        {
-            snprintf(g_lastError, sizeof(g_lastError), "AndroidBitmap_lockPixels失败");
-            if (g_recycleMid) env->CallVoidMethod(bmp, g_recycleMid);
-            env->DeleteLocalRef(bmp);
-            break;
-        }
-
-        cv::Mat *mat = new cv::Mat();
-        if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888)
-        {
-            cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, pixels);
-            cv::cvtColor(rgba, *mat, cv::COLOR_RGBA2BGR);
-        }
-        else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565)
-        {
-            cv::Mat rgb565((int)info.height, (int)info.width, CV_8UC2, pixels);
-            cv::cvtColor(rgb565, *mat, cv::COLOR_BGR5652BGR);
-        }
-        else
-        {
-            // 兜底按 RGBA 处理
-            cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, pixels);
-            cv::cvtColor(rgba, *mat, cv::COLOR_RGBA2BGR);
-        }
-        AndroidBitmap_unlockPixels(env, bmp);
-
-        // 立即回收 Bitmap 原生像素内存（cvtColor 已拷贝像素到独立 Mat，回收安全）
-        if (g_recycleMid)
-        {
-            if (env->ExceptionCheck()) env->ExceptionClear();
-            env->CallVoidMethod(bmp, g_recycleMid);
-            if (env->ExceptionCheck()) env->ExceptionClear();
-        }
-        env->DeleteLocalRef(bmp);
-
-        if (mat->empty())
-        {
+            cv::Mat *cropped = new cv::Mat((*mat)(roi).clone());
             delete mat;
-            snprintf(g_lastError, sizeof(g_lastError), "cvtColor后Mat为空");
-            result = nullptr;
+            snprintf(g_lastError, sizeof(g_lastError), "screencap ok");
+            return fromMat(cropped);
         }
-        else
-        {
-            result = fromMat(mat);
-            snprintf(g_lastError, sizeof(g_lastError), "ok");
-        }
-    } while (0);
+    }
+    snprintf(g_lastError, sizeof(g_lastError), "screencap ok");
+    return fromMat(mat);
+}
 
-    if (attached)
-        vm->DetachCurrentThread();
+void *screenshotImpl(int x, int y, int x1, int y1)
+{
+    // 路径 1：JNI 截图（最快 ~30ms）
+    static JavaVM *vm = nullptr;
+    if (!vm)
+        vm = getJavaVM();
+
+    void *result = nullptr;
+
+    if (vm)
+    {
+        JNIEnv *env = nullptr;
+        bool attached = false;
+        if (vm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK)
+        {
+            if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
+            {
+                LOGE("AttachCurrentThread failed");
+                snprintf(g_lastError, sizeof(g_lastError), "AttachCurrentThread失败");
+            }
+            else
+            {
+                attached = true;
+            }
+        }
+
+        if (env)
+        {
+            do
+            {
+                if (!resolveLuaEngine(env))
+                {
+                    LOGE("LuaEngine 解析失败: %s", g_lastError);
+                    break;
+                }
+
+                jobject bmp = env->CallStaticObjectMethod(g_luaEngineCls, g_snapMid,
+                                                           (jint)x, (jint)y, (jint)x1, (jint)y1);
+                if (env->ExceptionCheck())
+                {
+                    env->ExceptionClear();
+                    snprintf(g_lastError, sizeof(g_lastError), "LuaEngine.snapShot抛异常(截图服务未开启?)");
+                    LOGE("LuaEngine.snapShot 抛出异常");
+                }
+                if (!bmp)
+                {
+                    snprintf(g_lastError, sizeof(g_lastError), "snapShot返回null(截图服务未开启或坐标越界)");
+                    LOGE("snapShot 返回 null bitmap");
+                    break;
+                }
+
+                AndroidBitmapInfo info;
+                if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
+                {
+                    snprintf(g_lastError, sizeof(g_lastError), "AndroidBitmap_getInfo失败");
+                    if (g_recycleMid) env->CallVoidMethod(bmp, g_recycleMid);
+                    env->DeleteLocalRef(bmp);
+                    break;
+                }
+                void *pixels = nullptr;
+                if (AndroidBitmap_lockPixels(env, bmp, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
+                {
+                    snprintf(g_lastError, sizeof(g_lastError), "AndroidBitmap_lockPixels失败");
+                    if (g_recycleMid) env->CallVoidMethod(bmp, g_recycleMid);
+                    env->DeleteLocalRef(bmp);
+                    break;
+                }
+
+                cv::Mat *mat = new cv::Mat();
+                if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888)
+                {
+                    cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, pixels);
+                    cv::cvtColor(rgba, *mat, cv::COLOR_RGBA2BGR);
+                }
+                else if (info.format == ANDROID_BITMAP_FORMAT_RGB_565)
+                {
+                    cv::Mat rgb565((int)info.height, (int)info.width, CV_8UC2, pixels);
+                    cv::cvtColor(rgb565, *mat, cv::COLOR_BGR5652BGR);
+                }
+                else
+                {
+                    cv::Mat rgba((int)info.height, (int)info.width, CV_8UC4, pixels);
+                    cv::cvtColor(rgba, *mat, cv::COLOR_RGBA2BGR);
+                }
+                AndroidBitmap_unlockPixels(env, bmp);
+
+                if (g_recycleMid)
+                {
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                    env->CallVoidMethod(bmp, g_recycleMid);
+                    if (env->ExceptionCheck()) env->ExceptionClear();
+                }
+                env->DeleteLocalRef(bmp);
+
+                if (mat->empty())
+                {
+                    delete mat;
+                    snprintf(g_lastError, sizeof(g_lastError), "cvtColor后Mat为空");
+                    result = nullptr;
+                }
+                else
+                {
+                    result = fromMat(mat);
+                    snprintf(g_lastError, sizeof(g_lastError), "jni ok");
+                }
+            } while (0);
+
+            if (attached)
+                vm->DetachCurrentThread();
+        }
+    }
+    else
+    {
+        snprintf(g_lastError, sizeof(g_lastError), "getJavaVM失败(dlopen libart.so或RTLD_DEFAULT)");
+    }
+
+    // 路径 2：screencap 命令截图（root 模式 ~50ms，无需 JavaVM）
+    if (!result)
+    {
+        result = screenshotViaScreencap(x, y, x1, y1);
+    }
+
     return result;
 }
 
-// 诊断：返回最近一次 JNI 截图的错误信息（供 Lua 层调用）
+// 诊断：返回最近一次截图的错误信息
 extern "C" const char *getScreenshotError()
 {
     return g_lastError;
 }
 
 // 诊断：用 Java 反射列出 LuaEngine 类含 snap/capture/screen/bitmap 的方法
-// 帮助定位正确的截图方法名和签名（当 snapShot(IIII) 不存在时用）
 extern "C" const char *dumpLuaEngineMethods()
 {
     static char buf[4096];
@@ -281,7 +422,6 @@ extern "C" const char *dumpLuaEngineMethods()
         return buf;
     }
 
-    // getMethods() 含继承方法
     jclass classCls = env->FindClass("java/lang/Class");
     if (classCls)
     {
@@ -307,7 +447,6 @@ extern "C" const char *dumpLuaEngineMethods()
                         const char *cstr = env->GetStringUTFChars(str, nullptr);
                         if (cstr)
                         {
-                            // 只记录含 snap/capture/screen/bitmap 的方法（避免输出过长）
                             if (strstr(cstr, "nap") || strstr(cstr, "apture") ||
                                 strstr(cstr, "creen") || strstr(cstr, "itmap"))
                             {
