@@ -233,13 +233,22 @@ function OpenCV.screenshot(x, y, x1, y1)
     x = x or 0; y = y or 0; x1 = x1 or 0; y1 = y1 or 0
     local t0 = OpenCV.DEBUG and tickCount() or 0
 
-    -- 路径 1：C 层 JNI 截图（已修复 native 线程 ClassLoader，直接返回 Mat，无文件 I/O、原生区域裁剪）
-    -- 耗时约 20-40ms，是提速关键。需要 cf82f51 之后编译的 .so
+    -- 路径 1：C 层截图（JNI ~30ms / screencap ~50ms，无需文件 I/O，原生区域裁剪）
+    -- C 函数内部按 JNI → screencap → nullptr 顺序尝试，任一成功即返回 Mat
     local ok, mat = pcall(cv_lib.screenshot, x, y, x1, y1)
     if ok and isValid(mat) then
         if OpenCV.DEBUG then
-            print(string.format("[screenshot] JNI 截图 %dms (%d,%d,%d,%d)",
-                tickCount() - t0, x, y, x1, y1))
+            -- 读取 C 层错误信息判断用了哪条路径（成功时 g_lastError="jni ok" 或 "screencap ok"）
+            local method = "C层"
+            pcall(function()
+                local p = cv_lib.getScreenshotError()
+                if p then
+                    local s = ffi.string(p)
+                    if s and #s > 0 then method = s end
+                end
+            end)
+            print(string.format("[screenshot] %s截图 %dms (%d,%d,%d,%d)",
+                method, tickCount() - t0, x, y, x1, y1))
         end
         return mat
     end
